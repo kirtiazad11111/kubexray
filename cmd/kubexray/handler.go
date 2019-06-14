@@ -32,6 +32,7 @@ const (
 	Unrecognized ResourceType = iota
 	StatefulSet
 	Deployment
+	DaemonSet
 )
 
 // Action represents the action taken against a problematic pod.
@@ -43,24 +44,44 @@ const (
 	Delete
 )
 
-// Policy encodes the policy structures in the config.yaml file.
-type Policy struct {
-	deployments  Action
-	statefulSets Action
-	whitelist []string
-}
-
 // HandlerImpl is a sample implementation of Handler
 type HandlerImpl struct {
-	clusterurl   string
-	url          string
-	user         string
-	pass         string
-	slackWebhook string
-	webhookToken string
-	unscanned    Policy
-	security     Policy
-	license      Policy
+	clusterurl      string
+	url             string
+	user            string
+	pass            string
+	slackWebhook    string
+	webhookToken    string
+	namespaceconfig Config
+}
+type KubeXrayLog struct {
+	namespace              string                   `json:"namespace"`
+	isWhitelisted          bool                     `json:"isWhitelisted"`
+	isDefaultPolicyApplied bool                     `json:"isDefaultPolicyApplied"`
+	imageName              []NotifyComponentPayload `json:"imageName"`
+	isRecognized           bool                     `json:"isRecognized"`
+	hasSecurityIssues      bool                     `json:"hasSecurityIssues"`
+	hasLicenseIssues       bool                     `json:"hasLicenseIssues"`
+	actionTaken            string                   `json:"actionTaken"`
+	issuesSummary          interface{}                   `json:"issuesSummary"`
+}
+
+type Config struct {
+	WhitelistNamespaces []string
+	Namespaces          map[string]NamespacePolicy `yaml:"namespacepolicy"`
+	DefaultPolicy       NamespacePolicy
+}
+
+type NamespacePolicy struct {
+	Unscanned Policy
+	Security  Policy
+	License   Policy
+}
+
+type Policy struct {
+	Deployments  string
+	Statefulsets string
+	Others string
 }
 
 // NotifyComponentPayload is a component structure in NotifyPayload.
@@ -76,47 +97,6 @@ type NotifyPayload struct {
 	Action     string                   `json:"action"`
 	Cluster    string                   `json:"cluster_url"`
 	Components []NotifyComponentPayload `json:"components"`
-}
-
-// UnmarshalYAML is the unmarshaler implementation for the Policy type.
-func (x *Policy) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	var k map[string]interface{}
-	err := unmarshal(&k)
-	if err != nil {
-		return err
-	}
-	deps, _ := k["deployments"].(string)
-	switch deps {
-	case "ignore":
-		x.deployments = Ignore
-	case "scaledown":
-		x.deployments = Scaledown
-	case "delete":
-		x.deployments = Delete
-	default:
-		return errors.New("Cannot read action with value '" + deps + "'.")
-	}
-	sets, _ := k["statefulSets"].(string)
-	switch sets {
-	case "ignore":
-		x.statefulSets = Ignore
-	case "scaledown":
-		x.statefulSets = Scaledown
-	case "delete":
-		x.statefulSets = Delete
-	default:
-		return errors.New("Cannot read action with value '" + sets + "'.")
-	}
-	whitelist := make([]string, 0)
-	whitelists, _ := k["whitelistNamespaces"].([]interface{})
-	for _, ns := range whitelists {
-		namespace, ok := ns.(string)
-		if ok {
-			whitelist = append(whitelist, namespace)
-		}
-	}
-	x.whitelist = whitelist
-	return nil
 }
 
 // Init initializes the handler with configuration data.
@@ -137,27 +117,27 @@ func (t *HandlerImpl) Init(client kubernetes.Interface, config *rest.Config) err
 	t.pass = pass
 	t.slackWebhook = slack
 	t.webhookToken = token
-	unscanned, security, license, err := getConfig("/config/conf/config.yaml", "./config.yaml")
+	namespaceconfig, err := getConfig("/config/conf/config.yaml", "./config.yaml")
 	if err != nil {
 		log.Warn("Cannot read config.yaml: ", err)
 	}
-	t.unscanned = unscanned
-	t.security = security
-	t.license = license
 	if t.webhookToken != "" {
 		setupXrayWebhook(t, client)
 	}
+	t.namespaceconfig = namespaceconfig
+	log.Debug("Namespace list ", namespaceconfig)
 	return nil
+
 }
 
 // temporary structure for search results in webhook code
 type searchItem struct {
 	severity string
-	isstype string
-	sha2 string
-	name string
-	action string
-	pod *core_v1.Pod
+	isstype  string
+	sha2     string
+	name     string
+	action   string
+	pod      *core_v1.Pod
 }
 
 // parses the xray webhook request body
@@ -175,6 +155,8 @@ func parseWebhook(body interface{}) []searchItem {
 			log.Debugf("Unable to process webhook, xray did not include impacted component data. Payload: %v", body)
 			continue
 		}
+
+
 		for _, art := range issue["impacted_artifacts"].([]interface{}) {
 			artif := art.(map[string]interface{})
 			pkgtype := artif["pkg_type"].(string)
@@ -270,36 +252,49 @@ func handleXrayWebhook(t *HandlerImpl, client kubernetes.Interface) http.Handler
 		// check each match against the config to decide how to deal with it
 		for _, term := range searchresult {
 			_, typ := checkResource(client, term.pod)
-			if isWhitelistedNamespace(t, term.pod, true, term.isstype == "security", term.isstype == "license") {
+
+			if isWhitelistedNamespace(t, term.pod) {
 				log.Debug("Ignoring pod: %s (due to whitelisted namespace: %s)", term.pod.Name, term.pod.Namespace)
+				//KubeXrayLoging(pod.Namespace, iswhitelist, defaultpolicy, comps, rec, seciss, liciss, "Ignoring POD in whitelistnamespaces", "whitelistnamespaces")
 				continue
 			}
+
+			var namespacePolicy = t.namespaceconfig.Namespaces[term.pod.Namespace]
+
+			var podpolicy = term.pod.Namespace
+
+			_, ok := t.namespaceconfig.Namespaces[podpolicy]
+
+			if !ok {
+				namespacePolicy = t.namespaceconfig.DefaultPolicy
+			}
+
 			delete, scaledown := false, false
 			if typ == Deployment {
 				if term.isstype == "security" {
-					if t.security.deployments == Delete {
+					if namespacePolicy.Security.Deployments == "Delete" {
 						delete = true
-					} else if t.security.deployments == Scaledown {
+					} else if namespacePolicy.Security.Deployments == "Scaledown" {
 						scaledown = true
 					}
 				} else if term.isstype == "license" {
-					if t.license.deployments == Delete {
+					if namespacePolicy.Security.Deployments == "Delete" {
 						delete = true
-					} else if t.license.deployments == Scaledown {
+					} else if namespacePolicy.License.Deployments == "Scaledown" {
 						scaledown = true
 					}
 				}
 			} else if typ == StatefulSet {
 				if term.isstype == "security" {
-					if t.security.statefulSets == Delete {
+					if namespacePolicy.Security.Statefulsets == "Delete" {
 						delete = true
-					} else if t.security.statefulSets == Scaledown {
+					} else if namespacePolicy.Security.Statefulsets == "Scaledown" {
 						scaledown = true
 					}
 				} else if term.isstype == "license" {
-					if t.license.statefulSets == Delete {
+					if namespacePolicy.License.Statefulsets == "Delete" {
 						delete = true
-					} else if t.license.statefulSets == Scaledown {
+					} else if namespacePolicy.License.Statefulsets == "Scaledown" {
 						scaledown = true
 					}
 				}
@@ -340,6 +335,7 @@ func handleXrayWebhook(t *HandlerImpl, client kubernetes.Interface) http.Handler
 			}
 			payload := NotifyPayload{Name: group[0].pod.Name, Namespace: group[0].pod.Namespace, Action: act, Cluster: t.clusterurl, Components: comp}
 			// send a slack notification if applicable
+
 			if t.slackWebhook != "" {
 				notifyForPod(t.slackWebhook, payload, group[0].isstype == "security", group[0].isstype == "license")
 			}
@@ -355,41 +351,62 @@ func handleXrayWebhook(t *HandlerImpl, client kubernetes.Interface) http.Handler
 // ObjectCreated is called when an object is created
 func (t *HandlerImpl) ObjectCreated(client kubernetes.Interface, obj interface{}) {
 	pod := obj.(*core_v1.Pod)
+	defaultpolicy := false
+	iswhitelist := false
 	log.Debug("HandlerImpl.ObjectCreated")
 	_, typ := checkResource(client, pod)
-	comps, rec, seciss, liciss := getPodInfo(t, pod)
-	if isWhitelistedNamespace(t, pod, rec, seciss, liciss) {
+	comps, rec, seciss, liciss, resp := getPodInfo(t, pod)
+	if isWhitelistedNamespace(t, pod) {
 		log.Debug("Ignoring pod: %s (due to whitelisted namespace: %s)", pod.Name, pod.Namespace)
+		iswhitelist = true
+		KubeXrayLoging(pod.Namespace, iswhitelist, defaultpolicy, comps, rec, seciss, liciss, "Ignoring POD in whitelistnamespaces", resp)
 		return
 	}
+
+	var namespacePolicy = t.namespaceconfig.Namespaces[pod.Namespace]
+
+	var podpolicy = pod.Namespace
+
+	_, ok := t.namespaceconfig.Namespaces[podpolicy]
+
+	if !ok {
+		namespacePolicy = t.namespaceconfig.DefaultPolicy
+		defaultpolicy = true
+	}
+
 	delete, scaledown := false, false
 	check := func(pol Policy) {
-		if typ == Deployment && pol.deployments == Delete {
+		if typ == Deployment && pol.Deployments == "delete" {
 			delete = true
-		} else if typ == Deployment && pol.deployments == Scaledown {
+		} else if typ == Deployment && pol.Deployments == "scaledown" {
 			scaledown = true
-		} else if typ == StatefulSet && pol.statefulSets == Delete {
+		} else if typ == StatefulSet && pol.Statefulsets == "delete" {
 			delete = true
-		} else if typ == StatefulSet && pol.statefulSets == Scaledown {
+		} else if typ == StatefulSet && pol.Statefulsets == "scaledown" {
 			scaledown = true
-		}
+		} else if typ == DaemonSet && pol.Others == "delete" {
+		delete = true
+	}
 	}
 	if !rec {
-		check(t.unscanned)
+		check(namespacePolicy.Unscanned)
 	}
 	if seciss {
-		check(t.security)
+		check(namespacePolicy.Security)
 	}
 	if liciss {
-		check(t.license)
+		check(namespacePolicy.License)
 	}
+
 	act := ""
 	if delete {
 		act = "delete"
 	} else if scaledown {
 		act = "scaledown"
 	}
+
 	payload := NotifyPayload{Name: pod.Name, Namespace: pod.Namespace, Action: act, Cluster: t.clusterurl, Components: comps}
+	KubeXrayLoging(pod.Namespace, iswhitelist, defaultpolicy, comps, rec, seciss, liciss, act, resp)
 	if t.slackWebhook != "" && (!rec || seciss || liciss) {
 		notifyForPod(t.slackWebhook, payload, seciss, liciss)
 	}
@@ -402,6 +419,23 @@ func (t *HandlerImpl) ObjectCreated(client kubernetes.Interface, obj interface{}
 	} else {
 		log.Debugf("Ignoring pod: %s", pod.Name)
 	}
+}
+
+func KubeXrayLoging(namespace string, iswhitelisted bool, isdefaultpolicyapplied bool, imagename []NotifyComponentPayload, isrecognized bool, hassecurityissues bool, haslicenseissues bool, actiontaken string, issuessummary interface{}) {
+
+	//one pod have multiple image so using NotifyComponentPayload[] arrray so show multiple image name and sha
+	kubexraylogs := KubeXrayLog{
+		namespace:              namespace,
+		imageName:              imagename,
+		isRecognized:           isrecognized,
+		hasSecurityIssues:      hassecurityissues,
+		hasLicenseIssues:       haslicenseissues,
+		issuesSummary:          issuessummary,
+		isWhitelisted:          iswhitelisted,
+		actionTaken:            actiontaken,
+		isDefaultPolicyApplied: isdefaultpolicyapplied}
+	log.Debugf("%+v", kubexraylogs)
+	log.Infof("%+v", kubexraylogs)
 }
 
 // ObjectDeleted is called when an object is deleted
@@ -441,22 +475,16 @@ func sendXrayNotify(t *HandlerImpl, payload NotifyPayload) error {
 }
 
 // check if this namespace is in the whitelist for the provided violation type
-func isWhitelistedNamespace(t *HandlerImpl, pod *core_v1.Pod, rec, seciss, liciss bool) bool {
-	whitelist := make([]string, 0)
-	if !rec {
-		whitelist = append(whitelist, t.unscanned.whitelist...)
-	}
-	if seciss {
-		whitelist = append(whitelist, t.security.whitelist...)
-	}
-	if liciss {
-		whitelist = append(whitelist, t.license.whitelist...)
-	}
+func isWhitelistedNamespace(t *HandlerImpl, pod *core_v1.Pod) bool {
+	whitelist := t.namespaceconfig.WhitelistNamespaces
 	for _, ns := range whitelist {
 		if ns == pod.Namespace {
+			log.Debug("Return ns", ns)
 			return true
 		}
 	}
+
+	log.Debug("whitelist namespace value", whitelist)
 	return false
 }
 
@@ -521,8 +549,14 @@ func checkResource(client kubernetes.Interface, pod *core_v1.Pod) (string, Resou
 		return "", Unrecognized
 	}
 	subs2 := strings.LastIndexByte(pod.Name[:subs1], '-')
+	daemons := client.AppsV1().DaemonSets(pod.Namespace)
+	_, err := daemons.Get(pod.Name[:subs1], meta_v1.GetOptions{})
+	if err == nil {
+		return pod.Name[:subs1], DaemonSet
+	}
+	log.Debugf("Resource for pod %s is not stateful set %s: %v", pod.Name, pod.Name[:subs1], err)
 	sets := client.AppsV1().StatefulSets(pod.Namespace)
-	_, err := sets.Get(pod.Name[:subs1], meta_v1.GetOptions{})
+	_, err = sets.Get(pod.Name[:subs1], meta_v1.GetOptions{})
 	if err == nil {
 		return pod.Name[:subs1], StatefulSet
 	}
@@ -543,11 +577,13 @@ func checkResource(client kubernetes.Interface, pod *core_v1.Pod) (string, Resou
 // remove a pod by either deleting it, or scaling it to zero replicas
 func removePod(client kubernetes.Interface, pod *core_v1.Pod, typ ResourceType, delete bool) {
 	deps := client.AppsV1().Deployments(pod.Namespace)
+	daemons := client.AppsV1().DaemonSets(pod.Namespace)
 	sets := client.AppsV1().StatefulSets(pod.Namespace)
 	subs1 := strings.LastIndexByte(pod.Name, '-')
 	subs2 := strings.LastIndexByte(pod.Name[:subs1], '-')
 	setname := pod.Name[:subs1]
 	depname := pod.Name[:subs2]
+	daemonname :=pod.Name[:subs1]
 	if delete && typ == StatefulSet {
 		log.Infof("Deleting stateful set: %s", setname)
 		err := sets.Delete(setname, &meta_v1.DeleteOptions{})
@@ -584,17 +620,24 @@ func removePod(client kubernetes.Interface, pod *core_v1.Pod, typ ResourceType, 
 		if err != nil {
 			log.Warnf("Cannot update deployment: %s", err)
 		}
+	}else if delete && typ == DaemonSet {
+		log.Infof("Deleting Deamonset: %s", daemonname)
+		err := daemons.Delete(daemonname, &meta_v1.DeleteOptions{})
+		if err != nil {
+			log.Warnf("Cannot delete Deamonset: %s", err)
+		}
 	} else {
-		log.Warnf("Unable to handle case: delete = %v, type = %v", delete, typ)
+		log.Warnf("Unable to handle case: Deamonset = %v, type = %v", delete, typ)
 	}
 }
 
 // check a new pod against xray and extract useful information about it
-func getPodInfo(t *HandlerImpl, pod *core_v1.Pod) ([]NotifyComponentPayload, bool, bool, bool) {
+func getPodInfo(t *HandlerImpl, pod *core_v1.Pod) ([]NotifyComponentPayload, bool, bool, bool, interface{}) {
 	components := make([]NotifyComponentPayload, 0)
 	recognized := true
 	hassecissue := false
 	haslicissue := false
+	var response  interface{}
 	log.Debugf("Pod: %s v.%s (Node: %s, %s)", pod.Name, pod.ObjectMeta.ResourceVersion,
 		pod.Spec.NodeName, pod.Status.Phase)
 	for _, status := range pod.Status.ContainerStatuses {
@@ -607,34 +650,35 @@ func getPodInfo(t *HandlerImpl, pod *core_v1.Pod) ([]NotifyComponentPayload, boo
 		}
 		log.Debugf("Container: %s, Digest: %s", status.Image, sha2)
 		if sha2 != "NA" && t.url != "" {
-			rec, secissue, licissue, err := checkXray(sha2, t.url, t.user, t.pass)
+			rec, secissue, licissue, resp, err := checkXray(sha2, t.url, t.user, t.pass)
 			if err == nil {
 				comp := NotifyComponentPayload{Name: status.Image, Checksum: sha2}
 				components = append(components, comp)
 				recognized = recognized && rec
 				hassecissue = hassecissue || secissue
 				haslicissue = haslicissue || licissue
+				response = resp
 			}
 		}
 	}
-	return components, recognized, hassecissue, haslicissue
+	return components, recognized, hassecissue, haslicissue, response
 }
 
 // parse the config.yaml file and return its contents
-func getConfig(path, path2 string) (Policy, Policy, Policy, error) {
+func getConfig(path, path2 string) (Config, error) {
 	file, err := ioutil.ReadFile(path)
 	if err != nil {
 		file, err = ioutil.ReadFile(path2)
 		if err != nil {
-			return Policy{}, Policy{}, Policy{}, err
+			return Config{}, err
 		}
 	}
-	var data map[string]Policy
-	err = yaml.Unmarshal([]byte(file), &data)
+	var config Config
+	err = yaml.Unmarshal([]byte(file), &config)
 	if err != nil {
-		return Policy{}, Policy{}, Policy{}, err
+		return Config{}, err
 	}
-	return data["unscanned"], data["security"], data["license"], nil
+	return config, nil
 }
 
 // parse the xray_config.yaml file and return its contents
@@ -686,54 +730,58 @@ type ViolationAPIResponse struct {
 }
 
 // ask xray about the checksums in a given pod, specifically for any violations
-func checkXray(sha2, url, user, pass string) (bool, bool, bool, error) {
+func checkXray(sha2, url, user, pass string) (bool, bool, bool, interface{}, error) {
 	apiNotFound := errors.New("404 response, try the backup API instead")
 	log.Debugf("Checking sha %s with Xray ...", sha2)
 	var data ComponentAPIResponse
-	err := func(data *ComponentAPIResponse) error {
+	var response interface{}
+	 err := func(data *ComponentAPIResponse) (error) {
 		client := &http.Client{}
 		req, err := http.NewRequest("GET", url+"/api/v1/componentIdsByChecksum/"+sha2, nil)
 		if err != nil {
 			log.Warnf("Error checking xray: %s", err)
-			return err
+			return  err
 		}
 		req.SetBasicAuth(user, pass)
 		resp, err := client.Do(req)
 		if err != nil {
 			log.Warnf("Error checking xray: %s", err)
-			return err
+			return  err
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode == 404 {
-			return apiNotFound
+			return  apiNotFound
 		}
 		if resp.StatusCode != 200 {
 			log.Warnf("Error checking xray: response code is %s", resp.Status)
-			return errors.New("xray server responded with status: " + resp.Status)
+			return  err
 		}
+
+
 		err = json.NewDecoder(resp.Body).Decode(data)
 		if err != nil {
 			log.Warnf("Error checking xray: %s", err)
-			return err
+			return  err
 		}
-		return nil
+		return  nil
 	}(&data)
 	if err == apiNotFound {
 		log.Debug("404 response from componentIdsByChecksum, trying backup API instead")
 		return checkXrayBackup(sha2, url, user, pass)
 	}
 	if err != nil {
-		return false, false, false, err
+		return false, false, false, response, err
 	}
 	if len(data.Components) <= 0 {
+
 		log.Debug("Xray does not recognize this sha")
-		return false, false, false, nil
+		return false, false, false, response, nil
 	}
 	for _, comp := range data.Components {
 		bodyjson, err := json.Marshal(&comp)
 		if err != nil {
 			log.Warnf("Error checking xray: %s", err)
-			return false, false, false, err
+			return false, false, false, response, err
 		}
 		var resp ViolationAPIResponse
 		err = func(data *ViolationAPIResponse) error {
@@ -757,61 +805,70 @@ func checkXray(sha2, url, user, pass string) (bool, bool, bool, error) {
 				log.Warnf("Error checking xray: response code is %s", resp.Status)
 				return errors.New("xray server responded with status: " + resp.Status)
 			}
+
+
 			err = json.NewDecoder(resp.Body).Decode(data)
 			if err != nil {
 				log.Warnf("Error checking xray: %s", err)
 				return err
 			}
+
 			return nil
 		}(&resp)
+		response = resp
 		if err != nil {
-			return false, false, false, err
+			return false, false, false, response, err
 		}
 		for _, item := range resp.Data {
 			if item.Severity == "High" {
 				if item.Type == "security" {
 					log.Infof("Major security violation found for sha: %s", sha2)
-					return true, true, false, nil
+					return true, true, false, response, nil
 				} else if item.Type == "licenses" || item.Type == "license" {
 					log.Infof("Major license violation found for sha: %s", sha2)
-					return true, false, true, nil
+					return true, false, true, response, nil
 				}
 			}
 		}
 	}
 	log.Debug("No major security issues found")
-	return true, false, false, nil
+	return true, false, false, "No major security issues found", nil
 }
 
 // ask xray about the checksums in a given pod, specifically for any issues
-func checkXrayBackup(sha2, url, user, pass string) (bool, bool, bool, error) {
+func checkXrayBackup(sha2, url, user, pass string) (bool, bool, bool, interface{}, error) {
 	log.Debugf("Checking sha %s with Xray ...", sha2)
 	client := &http.Client{}
 	body := strings.NewReader("{\"checksums\":[\"" + sha2 + "\"]}")
 	req, err := http.NewRequest("POST", url+"/api/v1/summary/artifact", body)
 	if err != nil {
 		log.Warnf("Error checking xray: %s", err)
-		return false, false, false, err
+		return false, false, false, "", err
 	}
 	req.SetBasicAuth(user, pass)
 	req.Header.Add("Content-Type", "application/json")
 	resp, err := client.Do(req)
+
 	if err != nil {
 		log.Warnf("Error checking xray: %s", err)
-		return false, false, false, err
+		return false, false, false, "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		log.Warnf("Error checking xray: response code is %s", resp.Status)
-		return false, false, false, errors.New("xray server responded with status: " + resp.Status)
+		return false, false, false, "", errors.New("xray server responded with status: " + resp.Status)
 	}
+
+
+
 	var data interface{}
 	json.NewDecoder(resp.Body).Decode(&data)
 	dt := data.(map[string]interface{})
 	artifacts := dt["artifacts"].([]interface{})
+	log.Debug(data)
 	if len(artifacts) <= 0 {
 		log.Debug("Xray does not recognize this sha")
-		return false, false, false, nil
+		return false, false, false, data, nil
 	}
 	for _, artifact := range artifacts {
 		art := artifact.(map[string]interface{})
@@ -822,14 +879,14 @@ func checkXrayBackup(sha2, url, user, pass string) (bool, bool, bool, error) {
 			sev := is["severity"].(string)
 			if typ == "security" && (sev == "Major" || sev == "Critical" || sev == "High") {
 				log.Infof("Major security issue found for sha: %s", sha2)
-				return true, true, false, nil
+				return true, true, false, data, nil
 			}
 			if typ == "license" && (sev == "Major" || sev == "Critical" || sev == "High") {
 				log.Infof("Major license issue found for sha: %s", sha2)
-				return true, false, true, nil
+				return true, false, true, data, nil
 			}
 		}
 	}
 	log.Debug("No major security issues found")
-	return true, false, false, nil
+	return true, false, false, "No major security issues found", nil
 }

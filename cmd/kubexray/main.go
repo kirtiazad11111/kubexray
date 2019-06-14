@@ -16,6 +16,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/client-go/rest"
+	"github.com/robfig/cron"
 
 	// Import to initialize client auth plugins.
 	// Only GCP GKE auth is supported, Azure auth crashes with go-client v9.0.0
@@ -91,7 +92,33 @@ func main() {
 	client, config := getKubernetesClient()
 
 	namespace := os.Getenv("KUBE_XRAY_NS")
+	scron := os.Getenv("KUBE_XRAY_CRON")
+	handler := &HandlerImpl{}
+	if handler.Init(client, config) != nil {
+		os.Exit(1)
+	}
+	log.Info(scron)
+//Cron job function to run xray scan on scheduling time
+	if len(scron)>0 {
 
+		log.Debug("cronjob triggered")
+		d := cron.New();
+		d.AddFunc(scron, func() {
+			pods, err := client.CoreV1().Pods("").List(meta_v1.ListOptions{})
+			if err != nil {
+				panic(err.Error())
+			}
+			for _, pod := range pods.Items {
+				copy:=pod.DeepCopy()
+				handler.ObjectCreated(client,copy)
+			}
+
+		})
+		d.Run()
+
+	} else {
+
+		log.Info("Not in Cron Event Handler Triggered")
 	//Create the filtered informer
 	//See: cache.NewFilteredListWatchFromClient
 	informer := core_v1.NewFilteredPodInformer(client, namespace,
@@ -141,10 +168,7 @@ func main() {
 		},
 	})
 
-	handler := &HandlerImpl{}
-	if handler.Init(client, config) != nil {
-		os.Exit(1)
-	}
+
 
 	// construct the Controller object which has all of the necessary components to
 	// handle logging, connections, informing (listing and watching), the queue,
@@ -170,7 +194,7 @@ func main() {
 	signal.Notify(sigTerm, syscall.SIGTERM)
 	signal.Notify(sigTerm, syscall.SIGINT)
 	<-sigTerm
-}
+}}
 
 func enqueuePod(obj interface{}, queue workqueue.RateLimitingInterface, includeOnlyRunning bool) bool {
 	//We copy the object to the cache rather than store it by a string key and getting
@@ -181,6 +205,7 @@ func enqueuePod(obj interface{}, queue workqueue.RateLimitingInterface, includeO
 	if includeOnlyRunning && pod.Status.Phase != api_core_v1.PodRunning {
 		return false
 	}
+
 	copy := pod.DeepCopy()
 	queue.Add(copy)
 	return true

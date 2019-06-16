@@ -33,6 +33,11 @@ const (
 	StatefulSet
 	Deployment
 	DaemonSet
+	ReplicaSet
+	ReplicationController
+	Job
+	CronJob
+	Podonly
 )
 
 // Action represents the action taken against a problematic pod.
@@ -386,7 +391,17 @@ func (t *HandlerImpl) ObjectCreated(client kubernetes.Interface, obj interface{}
 			scaledown = true
 		} else if typ == DaemonSet && pol.Others == "delete" {
 		delete = true
-	}
+	} else if typ == ReplicaSet && pol.Others == "delete" {
+			delete = true
+		} else if typ == ReplicationController && pol.Others == "delete" {
+			delete = true
+		} else if typ == Job && pol.Others == "delete" {
+			delete = true
+		} else if typ == CronJob && pol.Others == "delete" {
+			delete = true
+		} else if typ == Podonly && pol.Others == "delete" {
+			delete = true
+		}
 	}
 	if !rec {
 		check(namespacePolicy.Unscanned)
@@ -546,7 +561,7 @@ func checkResource(client kubernetes.Interface, pod *core_v1.Pod) (string, Resou
 	subs1 := strings.LastIndexByte(pod.Name, '-')
 	if subs1 < 0 {
 		log.Debugf("Resource for pod %s is not a recognized resource type", pod.Name)
-		return "", Unrecognized
+		return "", Podonly
 	}
 	subs2 := strings.LastIndexByte(pod.Name[:subs1], '-')
 	daemons := client.AppsV1().DaemonSets(pod.Namespace)
@@ -554,7 +569,30 @@ func checkResource(client kubernetes.Interface, pod *core_v1.Pod) (string, Resou
 	if err == nil {
 		return pod.Name[:subs1], DaemonSet
 	}
-	log.Debugf("Resource for pod %s is not stateful set %s: %v", pod.Name, pod.Name[:subs1], err)
+	log.Debugf("Resource for pod %s is not deamonset set %s: %v", pod.Name, pod.Name[:subs1], err)
+
+	replicasetsobj := client.AppsV1().ReplicaSets(pod.Namespace)
+	_, err := replicasetsobj.Get(pod.Name[:subs1], meta_v1.GetOptions{})
+	if err == nil {
+		return pod.Name[:subs1], ReplicaSet
+	}
+	log.Debugf("Resource for pod %s is not ReplicaSet set %s: %v", pod.Name, pod.Name[:subs1], err)
+
+	replicationcontrollersobj := client.CoreV1().ReplicationControllers(pod.Namespace)
+	_, err := replicationcontrollersobj.Get(pod.Name[:subs1], meta_v1.GetOptions{})
+	if err == nil {
+		return pod.Name[:subs1], ReplicationController
+	}
+	log.Debugf("Resource for pod %s is not ReplicationController set %s: %v", pod.Name, pod.Name[:subs1], err)
+
+	jobsobj := client.BatchV1().Jobs(pod.Namespace)
+	_, err := jobsobj.Get(pod.Name[:subs1], meta_v1.GetOptions{})
+	if err == nil {
+		return pod.Name[:subs1], ReplicationController
+	}
+	log.Debugf("Resource for pod %s is not jobs set %s: %v", pod.Name, pod.Name[:subs1], err)
+
+
 	sets := client.AppsV1().StatefulSets(pod.Namespace)
 	_, err = sets.Get(pod.Name[:subs1], meta_v1.GetOptions{})
 	if err == nil {
@@ -563,27 +601,41 @@ func checkResource(client kubernetes.Interface, pod *core_v1.Pod) (string, Resou
 	log.Debugf("Resource for pod %s is not stateful set %s: %v", pod.Name, pod.Name[:subs1], err)
 	if subs2 < 0 {
 		log.Debugf("Resource for pod %s is not a recognized resource type", pod.Name)
-		return "", Unrecognized
+		return "", Podonly
 	}
+
+	cronjobsobj := client.BatchV1beta1().CronJobs(pod.Namespace)
+	_, err := cronjobsobj.Get(pod.Name[:subs2], meta_v1.GetOptions{})
+	if err == nil {
+		return pod.Name[:subs1], CronJob
+	}
+	log.Debugf("Resource for pod %s is not CronJob set %s: %v", pod.Name, pod.Name[:subs2], err)
+
 	deps := client.AppsV1().Deployments(pod.Namespace)
 	_, err = deps.Get(pod.Name[:subs2], meta_v1.GetOptions{})
 	if err == nil {
 		return pod.Name[:subs2], Deployment
 	}
+
+
 	log.Debugf("Resource for pod %s is not deployment %s: %v", pod.Name, pod.Name[:subs2], err)
-	return "", Unrecognized
+	return "", Podonly
 }
 
 // remove a pod by either deleting it, or scaling it to zero replicas
 func removePod(client kubernetes.Interface, pod *core_v1.Pod, typ ResourceType, delete bool) {
 	deps := client.AppsV1().Deployments(pod.Namespace)
-	daemons := client.AppsV1().DaemonSets(pod.Namespace)
+	daemonsobj := client.AppsV1().DaemonSets(pod.Namespace)
 	sets := client.AppsV1().StatefulSets(pod.Namespace)
-	subs1 := strings.LastIndexByte(pod.Name, '-')
+	cronjobsobj := client.BatchV1beta1().CronJobs(pod.Namespace)
+	jobsobj := client.BatchV1().Jobs(pod.Namespace)
+	replicationcontrollerobj := client.CoreV1().ReplicationControllers(pod.Namespace)
+	replicasetsobj := client.AppsV1().ReplicaSets(pod.Namespace)
+ 	subs1 := strings.LastIndexByte(pod.Name, '-')
 	subs2 := strings.LastIndexByte(pod.Name[:subs1], '-')
 	setname := pod.Name[:subs1]
 	depname := pod.Name[:subs2]
-	daemonname :=pod.Name[:subs1]
+	commonname :=pod.Name[:subs1]
 	if delete && typ == StatefulSet {
 		log.Infof("Deleting stateful set: %s", setname)
 		err := sets.Delete(setname, &meta_v1.DeleteOptions{})
@@ -621,13 +673,45 @@ func removePod(client kubernetes.Interface, pod *core_v1.Pod, typ ResourceType, 
 			log.Warnf("Cannot update deployment: %s", err)
 		}
 	}else if delete && typ == DaemonSet {
-		log.Infof("Deleting Deamonset: %s", daemonname)
-		err := daemons.Delete(daemonname, &meta_v1.DeleteOptions{})
+		log.Infof("Deleting Deamonset: %s", commonname)
+		err := daemonsobj.Delete(commonname, &meta_v1.DeleteOptions{})
 		if err != nil {
 			log.Warnf("Cannot delete Deamonset: %s", err)
 		}
+	}else if delete && typ == ReplicationController {
+		log.Infof("Deleting ReplicationController: %s", commonname)
+		err := replicationcontrollerobj.Delete(commonname, &meta_v1.DeleteOptions{})
+		if err != nil {
+			log.Warnf("Cannot delete ReplicationController: %s", err)
+		}
+	}else if delete && typ == ReplicaSet {
+		log.Infof("Deleting ReplicaSet: %s", commonname)
+		err := replicasetsobj.Delete(commonname, &meta_v1.DeleteOptions{})
+		if err != nil {
+			log.Warnf("Cannot delete ReplicaSet: %s", err)
+		}
+	}else if delete && typ == Job {
+		log.Infof("Deleting Job: %s", commonname)
+		err := jobsobj.Delete(commonname, &meta_v1.DeleteOptions{})
+		if err != nil {
+			log.Warnf("Cannot delete Job: %s", err)
+		}
+	}else if delete && typ == CronJob {
+		log.Infof("Deleting CronJob: %s", depname)
+		err := cronjobsobj.Delete(depname, &meta_v1.DeleteOptions{})
+		if err != nil {
+			log.Warnf("Cannot delete CronJob: %s", err)
+		}
+
 	} else {
-		log.Warnf("Unable to handle case: Deamonset = %v, type = %v", delete, typ)
+		log.Infof("Deleting Pods: %s", pod.Name)
+		podobj := client.CoreV1().Pods(pod.Namespace)
+		err := podobj.Delete( pod.Name, &meta_v1.DeleteOptions{})
+		if err != nil {
+			log.Warnf("Cannot delete Pods: %s", err)
+		}
+
+		log.Warnf("delete pods : = %v, type = %v", delete, typ)
 	}
 }
 

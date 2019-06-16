@@ -560,8 +560,8 @@ func notifyForPod(slack string, payload NotifyPayload, seciss, liciss bool) {
 func checkResource(client kubernetes.Interface, pod *core_v1.Pod) (string, ResourceType) {
 	subs1 := strings.LastIndexByte(pod.Name, '-')
 	if subs1 < 0 {
-		log.Debugf("Resource for pod %s is not a recognized resource type", pod.Name)
-		return "", Podonly
+		log.Debugf("Resource for pod %s its a pod type ", pod.Name)
+		return pod.Name, Podonly
 	}
 	subs2 := strings.LastIndexByte(pod.Name[:subs1], '-')
 	daemons := client.AppsV1().DaemonSets(pod.Namespace)
@@ -569,28 +569,28 @@ func checkResource(client kubernetes.Interface, pod *core_v1.Pod) (string, Resou
 	if err == nil {
 		return pod.Name[:subs1], DaemonSet
 	}
-	log.Debugf("Resource for pod %s is not deamonset set %s: %v", pod.Name, pod.Name[:subs1], err)
+	log.Debugf("Resource for pod %s is not deamonset  %s: %v", pod.Name, pod.Name[:subs1], err)
 
-	replicasetsobj := client.AppsV1().ReplicaSets(pod.Namespace)
-	_, err := replicasetsobj.Get(pod.Name[:subs1], meta_v1.GetOptions{})
+	replicasetsobjs := client.AppsV1().ReplicaSets(pod.Namespace)
+	_, err = replicasetsobjs.Get(pod.Name[:subs1], meta_v1.GetOptions{})
 	if err == nil {
 		return pod.Name[:subs1], ReplicaSet
 	}
-	log.Debugf("Resource for pod %s is not ReplicaSet set %s: %v", pod.Name, pod.Name[:subs1], err)
+	log.Debugf("Resource for pod %s is not ReplicaSet  %s: %v", pod.Name, pod.Name[:subs1], err)
 
-	replicationcontrollersobj := client.CoreV1().ReplicationControllers(pod.Namespace)
-	_, err := replicationcontrollersobj.Get(pod.Name[:subs1], meta_v1.GetOptions{})
+	replicationcontrollersobjs := client.CoreV1().ReplicationControllers(pod.Namespace)
+	_, err = replicationcontrollersobjs.Get(pod.Name[:subs1], meta_v1.GetOptions{})
 	if err == nil {
 		return pod.Name[:subs1], ReplicationController
 	}
-	log.Debugf("Resource for pod %s is not ReplicationController set %s: %v", pod.Name, pod.Name[:subs1], err)
+	log.Debugf("Resource for pod %s is not ReplicationController  %s: %v", pod.Name, pod.Name[:subs1], err)
 
-	jobsobj := client.BatchV1().Jobs(pod.Namespace)
-	_, err := jobsobj.Get(pod.Name[:subs1], meta_v1.GetOptions{})
+	jobsobjs := client.BatchV1().Jobs(pod.Namespace)
+	_, err = jobsobjs.Get(pod.Name[:subs1], meta_v1.GetOptions{})
 	if err == nil {
 		return pod.Name[:subs1], ReplicationController
 	}
-	log.Debugf("Resource for pod %s is not jobs set %s: %v", pod.Name, pod.Name[:subs1], err)
+	log.Debugf("Resource for pod %s is not jobs  %s: %v", pod.Name, pod.Name[:subs1], err)
 
 
 	sets := client.AppsV1().StatefulSets(pod.Namespace)
@@ -600,14 +600,13 @@ func checkResource(client kubernetes.Interface, pod *core_v1.Pod) (string, Resou
 	}
 	log.Debugf("Resource for pod %s is not stateful set %s: %v", pod.Name, pod.Name[:subs1], err)
 	if subs2 < 0 {
-		log.Debugf("Resource for pod %s is not a recognized resource type", pod.Name)
-		return "", Podonly
+		log.Debugf("Resource for pod %s is type pod", pod.Name)
+		return pod.Name, Podonly
 	}
-
-	cronjobsobj := client.BatchV1beta1().CronJobs(pod.Namespace)
-	_, err := cronjobsobj.Get(pod.Name[:subs2], meta_v1.GetOptions{})
+	cronjobsobjs := client.BatchV1beta1().CronJobs(pod.Namespace)
+	_, err = cronjobsobjs.Get(pod.Name[:subs2], meta_v1.GetOptions{})
 	if err == nil {
-		return pod.Name[:subs1], CronJob
+		return pod.Name[:subs2], CronJob
 	}
 	log.Debugf("Resource for pod %s is not CronJob set %s: %v", pod.Name, pod.Name[:subs2], err)
 
@@ -616,10 +615,8 @@ func checkResource(client kubernetes.Interface, pod *core_v1.Pod) (string, Resou
 	if err == nil {
 		return pod.Name[:subs2], Deployment
 	}
-
-
-	log.Debugf("Resource for pod %s is not deployment %s: %v", pod.Name, pod.Name[:subs2], err)
-	return "", Podonly
+	log.Debugf("Resource for pod %s its a pod type  %s: %v", pod.Name, pod.Name[:subs2], err)
+	return pod.Name, Podonly
 }
 
 // remove a pod by either deleting it, or scaling it to zero replicas

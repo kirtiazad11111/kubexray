@@ -311,6 +311,7 @@ func handleXrayWebhook(t *HandlerImpl, client kubernetes.Interface) http.Handler
 				} else {
 					term.action = "scaledown"
 				}
+
 				removePod(client, term.pod, typ, delete)
 			} else {
 				log.Debugf("Ignoring pod: %s", term.pod.Name)
@@ -426,6 +427,7 @@ func (t *HandlerImpl) ObjectCreated(client kubernetes.Interface, obj interface{}
 		notifyForPod(t.slackWebhook, payload, seciss, liciss)
 	}
 	if delete || scaledown {
+		log.Debug("remove pod function called")
 		removePod(client, pod, typ, delete)
 		err := sendXrayNotify(t, payload)
 		if err != nil {
@@ -621,6 +623,7 @@ func checkResource(client kubernetes.Interface, pod *core_v1.Pod) (string, Resou
 
 // remove a pod by either deleting it, or scaling it to zero replicas
 func removePod(client kubernetes.Interface, pod *core_v1.Pod, typ ResourceType, delete bool) {
+	log.Debug("Remove pod function Called",pod.Name,typ,delete)
 	deps := client.AppsV1().Deployments(pod.Namespace)
 	daemonsobj := client.AppsV1().DaemonSets(pod.Namespace)
 	sets := client.AppsV1().StatefulSets(pod.Namespace)
@@ -631,8 +634,10 @@ func removePod(client kubernetes.Interface, pod *core_v1.Pod, typ ResourceType, 
  	subs1 := strings.LastIndexByte(pod.Name, '-')
 	subs2 := strings.LastIndexByte(pod.Name[:subs1], '-')
 	setname := pod.Name[:subs1]
-	depname := pod.Name[:subs2]
-	commonname :=pod.Name[:subs1]
+	var depname = ""
+	if(subs2 > 0) {
+		depname = pod.Name[:subs2]
+	}
 	if delete && typ == StatefulSet {
 		log.Infof("Deleting stateful set: %s", setname)
 		err := sets.Delete(setname, &meta_v1.DeleteOptions{})
@@ -670,26 +675,27 @@ func removePod(client kubernetes.Interface, pod *core_v1.Pod, typ ResourceType, 
 			log.Warnf("Cannot update deployment: %s", err)
 		}
 	}else if delete && typ == DaemonSet {
-		log.Infof("Deleting Deamonset: %s", commonname)
-		err := daemonsobj.Delete(commonname, &meta_v1.DeleteOptions{})
+		log.Infof("Deleting Deamonset: %s", setname)
+		err := daemonsobj.Delete(setname, &meta_v1.DeleteOptions{})
 		if err != nil {
 			log.Warnf("Cannot delete Deamonset: %s", err)
 		}
 	}else if delete && typ == ReplicationController {
-		log.Infof("Deleting ReplicationController: %s", commonname)
-		err := replicationcontrollerobj.Delete(commonname, &meta_v1.DeleteOptions{})
+		log.Debug("Pod Relicationcontroller is call ")
+		log.Infof("Deleting ReplicationController: %s", setname)
+		err := replicationcontrollerobj.Delete(setname, &meta_v1.DeleteOptions{})
 		if err != nil {
 			log.Warnf("Cannot delete ReplicationController: %s", err)
 		}
 	}else if delete && typ == ReplicaSet {
-		log.Infof("Deleting ReplicaSet: %s", commonname)
-		err := replicasetsobj.Delete(commonname, &meta_v1.DeleteOptions{})
+		log.Infof("Deleting ReplicaSet: %s", setname)
+		err := replicasetsobj.Delete(setname, &meta_v1.DeleteOptions{})
 		if err != nil {
 			log.Warnf("Cannot delete ReplicaSet: %s", err)
 		}
 	}else if delete && typ == Job {
-		log.Infof("Deleting Job: %s", commonname)
-		err := jobsobj.Delete(commonname, &meta_v1.DeleteOptions{})
+		log.Infof("Deleting Job: %s", setname)
+		err := jobsobj.Delete(setname, &meta_v1.DeleteOptions{})
 		if err != nil {
 			log.Warnf("Cannot delete Job: %s", err)
 		}
@@ -699,7 +705,6 @@ func removePod(client kubernetes.Interface, pod *core_v1.Pod, typ ResourceType, 
 		if err != nil {
 			log.Warnf("Cannot delete CronJob: %s", err)
 		}
-
 	} else {
 		log.Infof("Deleting Pods: %s", pod.Name)
 		podobj := client.CoreV1().Pods(pod.Namespace)
@@ -707,7 +712,6 @@ func removePod(client kubernetes.Interface, pod *core_v1.Pod, typ ResourceType, 
 		if err != nil {
 			log.Warnf("Cannot delete Pods: %s", err)
 		}
-
 		log.Warnf("delete pods : = %v, type = %v", delete, typ)
 	}
 }
